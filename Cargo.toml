@@ -1,0 +1,20 @@
+[package]
+name = "bitcoin-handshake"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.73"
+bitcoin = "0.30.1"
+bytes = "1.4.0"
+random = "0.14.0"
+thiserror = "1.0.47"
+tokio = { version = "1.32.0", features = ["full"] }
+tokio-util = { version = "0.7.8", features = ["codec"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
+
+[dev-dependencies]
+tracing-test = "0.2.4"
