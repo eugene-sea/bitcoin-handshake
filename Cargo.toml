@@ -9,7 +9,8 @@ edition = "2021"
 async-trait = "0.1.73"
 bitcoin = "0.30.1"
 bytes = "1.4.0"
-random = "0.14.0"
+futures = "0.3.28"
+rand = "0.8.5"
 thiserror = "1.0.47"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-util = { version = "0.7.8", features = ["codec"] }

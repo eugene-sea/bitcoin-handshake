@@ -2,17 +2,22 @@ use async_trait::async_trait;
 use bitcoin::{
     consensus::{encode, Decodable, Encodable},
     network::{
+        constants::{ServiceFlags, PROTOCOL_VERSION},
         message::{NetworkMessage, RawNetworkMessage},
         message_network::VersionMessage,
-        Magic,
+        Address, Magic,
     },
 };
 use bytes::{Buf, BufMut, BytesMut};
+use futures::{SinkExt, StreamExt};
 use std::{
     cmp,
     io::{self},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::SystemTime,
 };
-use tokio_util::codec::{Decoder, Encoder};
+use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::trace;
 
 /// Bitcoin message header length in bytes
@@ -37,9 +42,14 @@ enum BitcoinP2pError {
     UnsupportedVersion(u32),
     #[error("bad nonce: {0}")]
     BadNonce(u64),
+    #[error("bad magic: {0}")]
+    BadMagic(Magic),
 }
 
-struct BitcoinNetworkMessageCodec;
+struct BitcoinNetworkMessageCodec {
+    magic: Magic,
+    max_payload_length: usize,
+}
 
 impl Decoder for BitcoinNetworkMessageCodec {
     type Item = NetworkMessage;
@@ -53,8 +63,7 @@ impl Decoder for BitcoinNetworkMessageCodec {
         let payload_length =
             u32::from_le_bytes(src[16..20].try_into().expect("Can read payload length")) as usize;
 
-        if payload_length > MAX_PAYLOAD_LENGTH {
-            // TODO: Make the const as field of `BitcoinNetworkMessageCodec`
+        if payload_length > self.max_payload_length {
             return Err(BitcoinP2pError::TooLongPayload(payload_length));
         }
 
@@ -67,9 +76,11 @@ impl Decoder for BitcoinNetworkMessageCodec {
 
         let mut reader = src.split_to(header_and_payload_length).reader();
 
-        Ok(Some(
-            RawNetworkMessage::consensus_decode_from_finite_reader(&mut reader)?.payload,
-        ))
+        let message = RawNetworkMessage::consensus_decode_from_finite_reader(&mut reader)?;
+        if message.magic != self.magic {
+            return Err(BitcoinP2pError::BadMagic(message.magic));
+        }
+        Ok(Some(message.payload))
     }
 }
 
@@ -78,7 +89,7 @@ impl Encoder<NetworkMessage> for BitcoinNetworkMessageCodec {
 
     fn encode(&mut self, message: NetworkMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let raw_message = RawNetworkMessage {
-            magic: Magic::BITCOIN, // TODO: Make as field of `BitcoinNetworkMessageCodec`
+            magic: self.magic,
             payload: message,
         };
         raw_message.consensus_encode(&mut dst.writer())?;
@@ -92,7 +103,8 @@ trait BitcoinP2pCommunicationChannel {
     async fn read_message(&mut self) -> Result<NetworkMessage, BitcoinP2pError>;
 }
 
-/// If `accept` is `true` we accept handshake, otherwise we initiate
+/// Makes handshake with other node. If `accept` is `true` we accept
+/// handshake, otherwise we initiate
 async fn handshake<C>(
     mut channel: C,
     accept: bool,
@@ -108,7 +120,7 @@ where
         channel
             .write_message(NetworkMessage::Version(version.clone()))
             .await?;
-        trace!(?version, "Send version");
+        trace!(?version, "Sent version");
     }
 
     let their_version = match channel.read_message().await? {
@@ -134,10 +146,10 @@ where
         channel
             .write_message(NetworkMessage::Version(version.clone()))
             .await?;
-        trace!(?version, "Send version");
+        trace!(?version, "Sent version");
     } else {
         channel.write_message(NetworkMessage::Verack).await?;
-        trace!(?their_version, "Send verack");
+        trace!(?their_version, "Sent verack");
     }
 
     match channel.read_message().await? {
@@ -153,7 +165,7 @@ where
 
     if accept {
         channel.write_message(NetworkMessage::Verack).await?;
-        trace!(?their_version, "Send verack");
+        trace!(?their_version, "Sent verack");
     }
 
     let negotiated_version = cmp::min(our_version, their_version.version);
@@ -161,35 +173,89 @@ where
     Ok((channel, negotiated_version))
 }
 
-struct BitcoinPeer;
+struct BitcoinPeer {
+    framed: Framed<TcpStream, BitcoinNetworkMessageCodec>,
+}
+
+impl BitcoinPeer {
+    pub async fn connect<A>(
+        addr: A,
+        codec: BitcoinNetworkMessageCodec,
+    ) -> Result<Self, BitcoinP2pError>
+    where
+        A: ToSocketAddrs,
+    {
+        let stream = TcpStream::connect(addr).await?;
+        let framed = Framed::new(stream, codec);
+        Ok(Self { framed })
+    }
+}
 
 #[async_trait]
 impl BitcoinP2pCommunicationChannel for BitcoinPeer {
     async fn write_message(&mut self, message: NetworkMessage) -> Result<(), BitcoinP2pError> {
-        todo!()
+        self.framed.send(message).await
     }
 
     async fn read_message(&mut self) -> Result<NetworkMessage, BitcoinP2pError> {
-        todo!()
+        if let Some(message) = self.framed.next().await {
+            Ok(message?)
+        } else {
+            Err(BitcoinP2pError::IoError(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Stream was closed",
+            )))
+        }
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), BitcoinP2pError> {
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::TRACE)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("Can set default subscriber");
+
+    let peer = BitcoinPeer::connect(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
+        BitcoinNetworkMessageCodec {
+            magic: Magic::REGTEST,
+            max_payload_length: MAX_PAYLOAD_LENGTH,
+        },
+    )
+    .await?;
+    handshake(
+        peer,
+        false,
+        VersionMessage::new(
+            ServiceFlags::NONE,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Can get duration since epoch")
+                .as_secs() as i64,
+            Address::new(
+                &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                ServiceFlags::NONE,
+            ),
+            Address::new(
+                &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                ServiceFlags::NONE,
+            ),
+            rand::random(),
+            "test-agent".to_owned(),
+            0,
+        ),
+        PROTOCOL_VERSION,
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::Duration,
-    };
+    use std::time::Duration;
 
-    use bitcoin::network::{constants::ServiceFlags, Address};
     use tokio::{
         join,
         sync::mpsc::{channel, Receiver, Sender},
@@ -201,7 +267,10 @@ mod tests {
 
     #[test]
     fn bitcoin_network_message_codec_encode_decode() {
-        let mut codec = BitcoinNetworkMessageCodec;
+        let mut codec = BitcoinNetworkMessageCodec {
+            magic: Magic::BITCOIN,
+            max_payload_length: MAX_PAYLOAD_LENGTH,
+        };
         let mut bytes = BytesMut::new();
         let msg = NetworkMessage::Ping(7);
 
