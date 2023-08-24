@@ -1,3 +1,10 @@
+use std::{
+    cmp,
+    io::{self},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::SystemTime,
+};
+
 use async_trait::async_trait;
 use bitcoin::{
     consensus::{encode, Decodable, Encodable},
@@ -10,12 +17,6 @@ use bitcoin::{
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
-use std::{
-    cmp,
-    io::{self},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::SystemTime,
-};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::trace;
